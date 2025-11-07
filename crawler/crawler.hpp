@@ -8,44 +8,83 @@
 
 #pragma once 
 
+#include <algorithm>
+#include <chrono>
 #include <exception>
-#include <functional> 
+#include <optional>
 #include <stdexcept>
-#include <string_view>
-#include <vector> 
+#include <string>
 #include <thread> 
+#include <unordered_map>
+#include <vector> 
 
-#include <boost/json/src.hpp>  
+#include <boost/json.hpp>  
+#include "crawler_support.hpp"
 #include "http.hpp"
 #include "json.hpp"
 
 namespace crwl {
 
-namespace json = boost::json; 
+namespace json = boost::json;
 
+/************ crwl::Crawler *******************************/
 /*
- * Handler for breaking pulled json into a vector of Items (defined by template)
- *
- */ 
-template <class Item> 
-using JsonHandler = 
-  std::function<std::vector<Item>(const json::object&, const std::vector<std::string>&)>;
-
-/*
- *
- *
  */
 template <class Item> 
 class Crawler {
 public:
 
+  Crawler(
+    const CrawlerMetadata& m,
+    const Handlers<Item>& h, 
+    size_t retries = 5
+  ) : meta_(m), fns_(h) {} 
+
+  /********** crwl::cycle() *******************************/ 
+  /* Fetches data over all endpoints into map 
+   * Sends range of map into sqlite_handler to parse into database 
+   */
+  void cycle() 
+  { 
+    item_map_.clear(); 
+    try {
+      // For each endpoint fetch 
+      for (auto& endpoint : meta_.endpoints) {
+        drain_endpoint_(endpoint);
+      }
+    } catch (const std::exception& e) {
+      throw std::runtime_error(std::string("crwl::cycle: fetch choked: ") + e.what());
+    }
+    
+    // Call over range of elements in map from previous fetch 
+    fns_.sqlite_handler(item_map_.cbegin(), item_map_.cend());
+  }
 
 private:
-  std::string key, base;              // api key and base url to hit  
-  std::vector<std::string> endpoints; // all endpoints to hit, 
-  std::vector<std::string> fields;    // all fields to access
-  JsonHandler<Item> json_handler;     // handles split of json object  
+  std::unordered_map<std::string, std::vector<Item>> item_map_{};
+  CrawlerMetadata meta_;
+  Handlers<Item> fns_; 
   size_t retries{5}; 
+
+  /**/
+  /*
+   *
+   *
+   */
+  void 
+  drain_endpoint_(const Endpoint& endpoint)
+  {
+    PaginationState state{}; 
+    do {
+      auto batch = fetch(endpoint, state);
+      append_batch_(endpoint.fields, batch); 
+      update_state_(endpoint.pagination, batch, state);
+
+      if ( !state.exhausted && endpoint.pagination.page_delay.count() > 0 ) {
+        std::this_thread::sleep_for(endpoint.pagination.page_delay);
+      }
+    } while ( !state.exhausted ); 
+  }
 
   /*
    * Executes a single request on the specified endpoint, converts into Item vector  
@@ -56,32 +95,47 @@ private:
    * We return: 
    *   Vector of Items (specified by template) or an value error exception 
    */ 
-  std::vector<Item>
-  fetch(std::string_view endpoint) const 
+  PageBatch<Item>
+  fetch(const Endpoint& endpoint, const PaginationState& state) 
   {
-    const std::string url = base + std::string(endpoint); 
+    const std::string url = build_url_(meta_.base_url, endpoint, state); 
     try {
       // get body of request and parse into value  
       std::string body = request_with_retries_(url);
       const json::object& root = jsc::as_obj(jsc::parse(body)); 
-      
-      // convert into vector based on input fields 
-      return json_handler(root, fields);
+
+      auto batch = fns_.json_handler(root, endpoint.fields, state); 
+      if ( endpoint.fields.size() != batch.items.size() ) {
+        throw std::runtime_error("resulting item vector is too small");
+      }
+      return batch; 
     } catch (...) {
       std::throw_with_nested(std::runtime_error("crwl::fetch failed: " + url)); 
     }
   }
 
+  /********** crwl::request_with_retries_() ***************/ 
+  /* Makes requests at the built url for specified number of retries 
+   * 
+   * Caller Provides: 
+   *   String representing the url to be made and requested at 
+   *
+   * We return: 
+   *   The json returned as a string (or "" and exception for error)
+   *
+   */
   std::string 
   request_with_retries_(const std::string& url) const 
   {
     std::string current = url; 
     auto backoff = std::chrono::milliseconds(200);
 
+    // Limit to some maximum number of retries
     for (size_t attempt{1}; attempt <= retries; attempt++) {
+      // Exception is for is_retryable or critical error 
       try {
         auto l_url = htc::parse_url(current); 
-        auto [res, status] = htc::request(key, l_url);
+        auto [res, status] = htc::request(meta_.api_key, l_url);
         
         // implies a redirect 
         if ( status == 1 ) {
@@ -91,8 +145,7 @@ private:
         } else if ( status == 0 ) {
           return std::move(res); 
         }
-      } 
-      catch (const std::exception& e) {
+      } catch (const std::exception& e) {
         if ( attempt == retries ) {
           throw std::runtime_error(
               std::string("failure to complete request: ") + e.what());
@@ -103,7 +156,77 @@ private:
         continue; 
       }
     }
+
+    throw std::runtime_error("request_with_retries_: exhausted attemps w/o resp");
+  }
+
+  /********** append_batch_() *****************************/ 
+  /* Appends an entire batch onto the item_map using the fields associated with
+   * the current endpoint. 
+   * 
+   * Does so safely making the assumption that fields.size() != batch.size() 
+   * necessarily 
+   *
+   * Caller Provides: 
+   *   Field vector and current batch from page 
+   *
+   * We modify: 
+   *   Item_map has elements inserted for each field that can be associated with 
+   *   an element from the PageBatch 
+   */  
+  void 
+  append_batch_(const std::vector<Field>& fields, const PageBatch<Item>& batch)
+  {
+    if ( fields.empty() || batch.items.empty() ) {
+      return;
+    }
+
+    const size_t columns = std::min(fields.size(), batch.items.size());
+    for (size_t i{0}; i < columns; i++) {
+      const auto& field = fields[i];
+      const auto& chunk = batch.items[i];
+      auto& bucket = item_map_[field.alias.value_or(field.name)];
+      bucket.insert(bucket.end(), chunk.begin(), chunk.end());
+    }
+  }
+
+  /********** update_state_() *****************************/ 
+  /* Updates the state of the PaginationState FSM depending on the previous 
+   * batch. Uses metadata stored within the PageBatch struct to make determinations 
+   * on how FSM should be updated 
+   *
+   * Caller Provides: 
+   *   PaginationConfig 
+   *   Last PageBatch 
+   *   Current PaginationState
+   *
+   * We modify: 
+   *   PaginationState to update into next state 
+   */ 
+  void 
+  update_state_(const PaginationConfig& cfg, const PageBatch<Item>& batch,
+                PaginationState& state) 
+  {
+    size_t rows = 0;
+    for (const auto& column : batch.items) {
+      rows = std::max(rows, column.size());
+    }
+
+    // update counters, move cursor
+    state.items_seen += rows;
+    state.page_index += 1;
+    state.cursor = std::move(batch.cursor); // move? 
+
+    // check all possible flags
+    const bool reached_max = cfg.max_pages > 0 && state.page_index >= cfg.max_pages;
+    const bool pagination_disabled = cfg.mode == PaginationConfig::Mode::None;
+    const bool cursor_missing = (cfg.mode == PaginationConfig::Mode::Cursor) &&
+                                batch.has_more && !batch.cursor.has_value();
+    const bool no_more = pagination_disabled ? true : !batch.has_more;
+
+    // move to end state if any flag is raised 
+    state.exhausted = reached_max || cursor_missing || no_more;
   }
 }; 
 
-}
+} // end namespace crwl 
