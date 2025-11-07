@@ -1,5 +1,7 @@
 # Multiview Learning of Data Categories as Manifolds 
 
+Model leveraging Manifold Learning techniques that aims to predict Population Density and its Gradient across the Contiguous United States. Includes custom implementation of highly flexible and performant C++ Client Backbone for Data Ingestion. 
+
 ## Data Categories 
 
 I will pull data from 8-10 various parent categories that offer underlying information about change in population density. 
