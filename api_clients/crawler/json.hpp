@@ -1,8 +1,8 @@
 /*
+ * json.hpp  Andrew Belles  Nov 6th, 2025 
  *
- *
- *
- *
+ * Definition of all json related helper functions that aim to simplfy
+ * interacting with the boost/json external library  
  *
  */ 
 
@@ -10,7 +10,6 @@
 
 #include <boost/json.hpp>
 #include <stdexcept>
-#include <string> 
 #include <string_view> 
 
 namespace jsc {

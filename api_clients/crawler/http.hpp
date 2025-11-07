@@ -1,3 +1,10 @@
+/*
+ * http.hpp  Andrew Belles  Nov 7th, 2025 
+ * 
+ * Provides Interface for exposed http helper functions for Crawler 
+ *
+ *
+ */ 
 
 #pragma once 
 

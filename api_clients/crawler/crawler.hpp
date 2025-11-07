@@ -1,9 +1,9 @@
 /*
+ * crawler.hpp  Andrew Belles  Nov 6th, 2025 
  *
- *
- *
- *
- *
+ * Base Crawler. Implements request functionality and allows for custom handlers  
+ * Which provide a layer of abstraction for both parsing requested json from some 
+ * api and also handling insertion into an sqlite database 
  */ 
 
 #pragma once 
@@ -28,7 +28,16 @@ namespace crwl {
 namespace json = boost::json;
 
 /************ crwl::Crawler *******************************/
-/*
+/* Crawler Interface
+ *
+ * Templates: 
+ *   Item: A struct that contains a single JSON block from whatever API hit. 
+ *
+ * TODO: 
+ *   - Finish Pagination 
+ *   - Introduce trait bounds on Item such that we guarantee the json and sqlite 
+ *     handlers have deterministic behavior when acting on Item 
+ *
  */
 template <class Item> 
 class Crawler {
@@ -66,17 +75,22 @@ private:
   Handlers<Item> fns_; 
   size_t retries{5}; 
 
-  /**/
-  /*
+  /********** drain_endpoint_() ***************************/
+  /* For each endpoint, make request and drain the endpoint until PaginationState 
+   * reaches end state. 
    *
+   * Crawler Provides: 
+   *   the individual endpoint that should be requested at 
    *
+   * Crawler modifies: 
+   *   Item_map has items in batch insterted per field 
    */
   void 
   drain_endpoint_(const Endpoint& endpoint)
   {
     PaginationState state{}; 
     do {
-      auto batch = fetch(endpoint, state);
+      auto batch = fetch_(endpoint, state);
       append_batch_(endpoint.fields, batch); 
       update_state_(endpoint.pagination, batch, state);
 
@@ -86,17 +100,19 @@ private:
     } while ( !state.exhausted ); 
   }
 
-  /*
-   * Executes a single request on the specified endpoint, converts into Item vector  
+  /********** fetch() *************************************/
+  /* Executes a single request on the specified endpoint, handles Pagination through
+   * a FSM stored in PaginationState struct 
    * 
-   * Caller Provides: 
+   * Crawler Provides: 
    *   Endpoint of API to hit on 
+   *   Current state of Paging FSM 
    *
-   * We return: 
-   *   Vector of Items (specified by template) or an value error exception 
+   * Returns to Crawler: 
+   *   Returns a PageBatch struct to be handled within drain_endpoint_
    */ 
   PageBatch<Item>
-  fetch(const Endpoint& endpoint, const PaginationState& state) 
+  fetch_(const Endpoint& endpoint, const PaginationState& state) 
   {
     const std::string url = build_url_(meta_.base_url, endpoint, state); 
     try {
@@ -122,7 +138,6 @@ private:
    *
    * We return: 
    *   The json returned as a string (or "" and exception for error)
-   *
    */
   std::string 
   request_with_retries_(const std::string& url) const 
@@ -215,7 +230,7 @@ private:
     // update counters, move cursor
     state.items_seen += rows;
     state.page_index += 1;
-    state.cursor = std::move(batch.cursor); // move? 
+    state.cursor = batch.cursor; 
 
     // check all possible flags
     const bool reached_max = cfg.max_pages > 0 && state.page_index >= cfg.max_pages;

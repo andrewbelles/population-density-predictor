@@ -1,11 +1,10 @@
 /*
- *
- *
- *
- *
+ * crawler_support.hpp  Andrew Belles Nov 7th, 2025 
+ * 
+ * Defines the structures and detached helper functions that the  
+ * Crawler Class requires
  *
  */ 
-
 
 #pragma once 
 
@@ -16,6 +15,8 @@
 #include <chrono> 
 #include <unordered_map>
 #include <functional> 
+#include <string_view> 
+#include <stdexcept>
 
 #include <boost/json.hpp>  
 
@@ -72,6 +73,12 @@ struct CrawlerMetadata {
   std::string api_key;              // Authorization header value
   std::string base_url;             // Base domain/schema for requests
   std::vector<Endpoint> endpoints;  // All endpoint definitions to crawl
+
+  void 
+  update_endpoints(std::vector<Endpoint> new_endpoints)
+  {
+    endpoints = std::move(new_endpoints);
+  }
 };
 
 template <class Item> 
@@ -166,4 +173,3 @@ build_url_(const std::string& base, const Endpoint& endpoint,
 }
 
 } // end namespace crwl 
-

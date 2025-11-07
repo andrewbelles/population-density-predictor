@@ -1,9 +1,9 @@
 /*
+ * http.cpp  Andrew Belles  Nov 7th, 2025 
  *
- *
- *
- *
- *
+ * Implementation of request function that Crawler wraps over with 
+ * Retry. Provides dynamic interface which can connect to https or http  
+ * connections properly. Robust to bad http responses 
  */ 
 
 #pragma once 
