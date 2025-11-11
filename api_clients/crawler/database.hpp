@@ -15,6 +15,8 @@
 // #include <functional> 
 #include <sqlite3.h>
 
+namespace dat {
+
 /************ Sqlite Deleter ******************************/ 
 /* Simple deleter struct to safely close a unique_ptr to sqlite3* 
  */
@@ -176,7 +178,7 @@ public:
   }
 
 protected: 
-  virtual void sqlite_handler(MapIt first, MapIt last) = 0;// 
+  virtual void sqlite_handler(MapIt first, MapIt last) = 0; 
   
   void bind(sqlite3_stmt* stmt, int idx, std::string_view value)
   {
@@ -223,3 +225,5 @@ protected:
 private: 
   std::unique_ptr<sqlite3, SqliteDeleter> db_{nullptr};
 };
+
+}

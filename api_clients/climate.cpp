@@ -6,58 +6,255 @@
  *
  */ 
 
+#include <chrono>
+#include <string>
+#include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "crawler/crawler.hpp"
+#include "crawler/database.hpp"
 #include "crawler/crawler_support.hpp"
 
-struct Station {}; 
-struct Climate {};
+using BBox = std::tuple<double, double, double, double>; 
 
+/************ SQL Queries *********************************/ 
+static const std::string upsert_sql = 
+R"(
+INSERT INTO stations (
+  station_id, 
+  name, 
+  state,
+  latitude, 
+  longitude, 
+  elevation_m, 
+  metadata, 
+  last_ingested
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, json(?7), CURRENT_TIMESTAMP)
+  ON CONFLICT(station_id) DO UPDATE SET 
+  name          = excluded.name,
+  state         = excluded.state, 
+  latitude      = excluded.latitude,
+  longitude     = excluded.longitude,
+  elevation_m   = excluded.elevation_m,
+  metadata      = excluded.metadata, 
+  last_ingested = excluded.last_ingested;
+)"; 
 
-class ClimateClient {
-public:
+/************ Local Data Structures ***********************/ 
 
+/************ StationSeed *********************************/ 
+/* Stores data about a single potential station 
+ * to make a request at 
+ */
+struct StationSeed {
+  std::string region_id; 
+  BBox extent; 
+  int limit{1000}; 
+};
+
+/************ StationConfig *******************************/
+/* Stores data required for configuring Station Client at 
+ * construction time 
+ */
+struct StationConfig {
+  std::string base_url{"https://www.ncdc.noaa.gov/cdo-web/api/v2"};
+  std::string api_key; 
+  size_t max_queue{512}; 
+  size_t retries{5}; 
+  std::chrono::seconds backoff{1}; 
+  millis page_delay{250};
+};
+
+/************ StationRecord *******************************/ 
+/* Single Station Item to be upserted into climate.db 
+ */ 
+struct StationRecord {
+  std::string station_id; 
+  std::string name; 
+  std::string state; 
+  double latitude; 
+  double longitude; 
+  double elevation_m; 
+  json::object metadata; 
+};
+
+/************ Type Bindings *******************************/ 
+using StationMap = std::unordered_map<std::string, std::vector<StationRecord>>;
+using StationIterator = StationMap::const_iterator; 
+
+/************ Primary Classes *****************************/ 
+
+/************ ClimateDB ***********************************/ 
+/* Child Class of SqliteDB which implements upsert method 
+ * and sqlite_handler for climate.db  
+ *
+ * Finalizes abstract SqliteDB class 
+ */ 
+class ClimateDB final : public dat::SqliteDB<StationIterator> {
+public: 
+  using Base = dat::SqliteDB<StationIterator>; 
+
+  // Explicit, Basic Constructor 
+  explicit ClimateDB(std::string&& path, 
+                     int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+    : Base(std::move(path), flags) {}
+
+  ClimateDB(ClimateDB&&) noexcept = default;
+
+protected: 
+
+  /********** ClimateDB override : sqlite_handler ***********/ 
+  /* Iterates over the Station Map, calling upsert_ for all 
+   * non-empty entries. 
+   *
+   * Caller provides: 
+   *   Iterator range from a StationMap object 
+   */ 
+  void sqlite_handler(StationIterator first, StationIterator last) override 
+  {
+    for (; first != last; first++) {
+      const auto& item = first->second; 
+      if ( item.empty() ) {
+        continue; 
+      }
+
+      const auto& field = first->first; 
+      if ( field == "stations" ) {
+        upsert_stations_(item);
+      }
+    }
+  }
 
 private: 
-  /********** Custom Typing and Declaration of Handlers ****/ 
-  using StationMapType  = std::unordered_map<std::string, std::vector<Station>>;
-  using ClimateMapType  = std::unordered_map<std::string, std::vector<Climate>>;
-  using StationIterator = typename StationMapType::const_iterator;  
-  using ClimateIterator = typename ClimateMapType::const_iterator;  
 
-  crwl::Crawler<Station> station_; 
-  crwl::Crawler<Climate> climate_; 
-
-  crwl::Handlers<Station> StationHandler_{ station_handler, station_insert }; 
-  crwl::Handlers<Climate> ClimateHandler_{ climate_handler, climate_insert }; 
-
-  static crwl::PageBatch<Station> 
-  station_handler(const json::object& obj, const std::vector<crwl::Field>& fields, 
-                  const crwl::PaginationState& state)
+  /********** ClimateDB::upsert_ ****************************/ 
+  /* Upserts all records from given row into the climate.db  
+   * under the stations schema (See climate_init.sql to see schema)
+   */ 
+  void upsert_stations_(const std::vector<StationRecord>& rows)
   {
+    sqlite3_stmt* stmt = nullptr; 
+    try {
+      stmt = prepare(upsert_sql); 
+      for (const auto& record : rows) {
+        bind(stmt, 1, record.station_id);
+        bind(stmt, 2, record.name); 
+        bind(stmt, 3, record.state);
 
+        auto bind_double = [&](int idx, double value) {
+          const int code = sqlite3_bind_double(stmt, idx, value); 
+          if ( code != SQLITE_OK ) {
+            throw std::runtime_error("ClimateDB::upsert_ bind_double failed"); 
+          }
+        }; 
+
+        bind_double(4, record.latitude); 
+        bind_double(5, record.longitude); 
+        bind_double(6, record.elevation_m); 
+
+        const std::string metadata = json::serialize(record.metadata); 
+        bind(stmt, 7, metadata); 
+
+        step(stmt); 
+        sqlite3_reset(stmt); 
+        sqlite3_clear_bindings(stmt); 
+      }
+    } catch (...) {
+      finalize(stmt); 
+      throw; 
+    }
+
+    finalize(stmt); 
   }
-
-  static crwl::PageBatch<Climate> 
-  climate_handler(const json::object& obj, const std::vector<crwl::Field>& fields, 
-                  const crwl::PaginationState& state)
-  {
-
-  }
-
-  static int 
-  station_insert(StationIterator first, StationIterator last)
-  {
-
-  }
-
-  static int 
-  climate_insert(ClimateIterator first, ClimateIterator last)
-  {
-
-  }
-
-  /********** Private Members *****************************/
 
 };
+
+/************ StationClient *******************************/ 
+/*
+ */ 
+class StationClient {
+private: 
+  using Runner = crwl::Runner<StationRecord, StationSeed>;
+public: 
+  
+  StationClient(
+      StationConfig cfg, 
+      ClimateDB& db, 
+      crwl::Handlers<StationRecord> handlers
+  ) : cfg_(std::move(cfg)), 
+      db_(db), 
+    handlers_(std::move(handlers)), 
+    runner_(make_runner_()) {} 
+  
+  /********** getters/setters *****************************/
+  bool enqueue(StationSeed seed) { return runner_.enqueue(std::move(seed)); }
+  size_t backlog(void) const noexcept { return runner_.backlog(); }
+  Runner::Snapshot snapshot(void) const { return runner_.snapshot(); }
+
+  void set_on_idle(std::function<void(void)> idle_callback)
+  {
+    runner_.set_on_idle(std::move(idle_callback));     
+  }
+
+  void set_on_error(std::function<void(const std::exception&)> error_callback)
+  {
+    runner_.set_on_error(std::move(error_callback));     
+  }
+
+private: 
+  StationConfig cfg_; 
+  ClimateDB& db_; 
+  crwl::Handlers<StationRecord> handlers_; 
+  Runner runner_; 
+
+  Runner make_runner_(void)
+  {
+    auto meta = make_metadata_();
+    crwl::Crawler<StationRecord> crawler(meta, handlers_, cfg_.retries);
+    auto builder = [this](const StationSeed& seed) {
+      return build_endpoints_(seed); 
+    };
+    return Runner(std::move(crawler), std::move(builder), cfg_.max_queue);
+  }
+
+  crwl::CrawlerMetadata make_metadata_(void) const 
+  {
+    crwl::CrawlerMetadata meta{}; 
+    meta.api_key  = cfg_.api_key; 
+    meta.base_url = cfg_.base_url; 
+    return meta; 
+  }
+
+  std::vector<crwl::Endpoint> build_endpoints_(const StationSeed& seed) const 
+  {
+    crwl::Endpoint endpoint{}; 
+    endpoint.path = build_station_path_(seed); 
+    endpoint.fields.emplace_back(crwl::Field{"stations", std::nullopt});
+    endpoint.pagination.mode = crwl::PaginationConfig::Mode::Offset; 
+    endpoint.pagination.param_name = "offset"; 
+    endpoint.pagination.page_size = static_cast<size_t>(std::max(seed.limit, 1));
+    endpoint.pagination.page_delay = cfg_.page_delay; 
+
+    std::vector<crwl::Endpoint> endpoints; 
+    endpoints.push_back(std::move(endpoint));
+    return endpoints; 
+  }
+
+  std::string build_station_path_(const StationSeed& seed) const 
+  {
+    std::ostringstream oss; 
+    oss << "/stations?datasetid=GHCND"; 
+    if ( !seed.region_id.empty() ) {
+      oss << "&locationid=" << seed.region_id; 
+    }
+
+    const auto [south, west, north, east] = seed.extent; 
+    oss << "&extent=" << south << ',' << west << ',' << north << ',' << east; 
+
+    const int limit = seed.limit > 0? seed.limit : 1000; 
+    oss << "&limit=" << limit; 
+
+    return oss.str(); 
+  }
+}; 
