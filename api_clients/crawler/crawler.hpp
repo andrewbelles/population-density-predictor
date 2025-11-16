@@ -42,21 +42,18 @@ namespace crwl {
  *   Item: A struct that contains a single JSON block from whatever API hit. 
  *
  * TODO: 
- *   - Finish Pagination 
  *   - Introduce trait bounds on Item such that we guarantee the json and sqlite 
  *     handlers have deterministic behavior when acting on Item 
- *
  */
 template <class Item> 
 class Crawler {
 public:
 
   Crawler(
-    const CrawlerMetadata& m,
-    const Handlers<Item>& h, 
-    size_t retries = 5
-  ) : meta_(m), fns_(h) {} 
-
+    CrawlerMetadata& m,
+    Handlers<Item>& h, 
+    CrawlerConfig& cfg 
+  ) : meta_(std::move(m)), fns_(std::move(h)), cfg_(std::move(cfg)) {} 
 
   /********** setters *************************************/ 
   void set_metadata(CrawlerMetadata meta) { meta_ = std::move(meta); }
@@ -91,9 +88,9 @@ public:
 
 private:
   std::unordered_map<std::string, std::vector<Item>> item_map_{};
-  CrawlerMetadata meta_;
-  Handlers<Item> fns_; 
-  size_t retries{5}; 
+  CrawlerMetadata meta_{};
+  Handlers<Item> fns_{}; 
+  CrawlerConfig cfg_{};
 
   /********** drain_endpoint_() ***************************/
   /* For each endpoint, make request and drain the endpoint until PaginationState 
@@ -163,10 +160,10 @@ private:
   request_with_retries_(const std::string& url) const 
   {
     std::string current = url; 
-    auto backoff = std::chrono::milliseconds(200);
+    auto backoff = cfg_.backoff; 
 
     // Limit to some maximum number of retries
-    for (size_t attempt{1}; attempt <= retries; attempt++) {
+    for (size_t attempt{1}; attempt <= cfg_.retries; attempt++) {
       // Exception is for is_retryable or critical error 
       try {
         auto l_url = htc::parse_url(current); 
@@ -181,7 +178,7 @@ private:
           return std::move(res); 
         }
       } catch (const std::exception& e) {
-        if ( attempt == retries ) {
+        if ( attempt == cfg_.retries ) {
           throw std::runtime_error(
               std::string("failure to complete request: ") + e.what());
         }
@@ -250,7 +247,7 @@ private:
     // update counters, move cursor
     state.items_seen += rows;
     state.page_index += 1;
-    state.cursor = batch.cursor; 
+    state.cursor      = batch.cursor; 
 
     // check all possible flags
     const bool reached_max = cfg.max_pages > 0 && state.page_index >= cfg.max_pages;

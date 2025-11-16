@@ -32,6 +32,8 @@ INSERT INTO stations (
   latitude, 
   longitude, 
   elevation_m, 
+  active_start, 
+  active_end, 
   metadata, 
   last_ingested
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, json(?7), CURRENT_TIMESTAMP)
@@ -41,6 +43,8 @@ INSERT INTO stations (
   latitude      = excluded.latitude,
   longitude     = excluded.longitude,
   elevation_m   = excluded.elevation_m,
+  active_start  = excluded.active_start, 
+  active_end    = excluded.active_end, 
   metadata      = excluded.metadata, 
   last_ingested = excluded.last_ingested;
 )"; 
@@ -80,6 +84,8 @@ struct StationRecord {
   double latitude; 
   double longitude; 
   double elevation_m; 
+  std::string active_start;
+  std::string active_end; 
   boost::json::object metadata; 
 };
 
@@ -88,6 +94,7 @@ using StationMap = std::unordered_map<std::string, std::vector<StationRecord>>;
 using StationIterator = StationMap::const_iterator; 
 using Fields = std::vector<crwl::Field>;  
 
+/************ Local helper functions **********************/ 
 StationRecord parse_station_record(const boost::json::object& row);
 crwl::PageBatch<StationRecord> parse_station_page(const boost::json::object& root,
                                                   const Fields& fields,
@@ -106,7 +113,7 @@ public:
   using Base = dat::SqliteDB<StationIterator>; 
 
   // Explicit, Basic Constructor 
-  explicit ClimateDB(std::string&& path, 
+  ClimateDB(std::string&& path, 
                      int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
     : Base(std::move(path), flags) {}
 
@@ -118,15 +125,15 @@ public:
     try {
       sqlite_handler(first, last); 
       tx.commit(); 
-      return 0; 
+      return true; 
     } catch (...) {
       tx.rollback();
       throw; 
+      return false; 
     }
   }
 
 protected: 
-
   /********** ClimateDB override : sqlite_handler ***********/ 
   /* Iterates over the Station Map, calling upsert_ for all 
    * non-empty entries. 
@@ -175,9 +182,22 @@ private:
         bind_double(4, record.latitude); 
         bind_double(5, record.longitude); 
         bind_double(6, record.elevation_m); 
+        auto bind_date = [&](int idx, const std::string& value) {
+          if ( value.empty() ) {
+            const int code = sqlite3_bind_null(stmt, idx); 
+            if ( code != SQLITE_OK ) {
+              throw std::runtime_error("ClimateDB::upsert_ bind_null failed");
+            }
+          } else {
+            bind(stmt, idx, value); 
+          }
+        };
+
+        bind_date(7, record.active_start); 
+        bind_date(8, record.active_end); 
 
         const std::string metadata = boost::json::serialize(record.metadata); 
-        bind(stmt, 7, metadata); 
+        bind(stmt, 9, metadata); 
 
         step(stmt); 
         sqlite3_reset(stmt); 
@@ -233,7 +253,8 @@ private:
   Runner make_runner_(void)
   {
     auto meta = make_metadata_();
-    crwl::Crawler<StationRecord> crawler(meta, handlers_, cfg_.retries);
+    crwl::CrawlerConfig crawler_cfg{cfg_.retries, cfg_.backoff};
+    crwl::Crawler<StationRecord> crawler(meta, handlers_, crawler_cfg);
     auto builder = [this](const StationSeed& seed) {
       return build_endpoints_(seed); 
     };
@@ -253,9 +274,9 @@ private:
     crwl::Endpoint endpoint{}; 
     endpoint.path = build_station_path_(seed); 
     endpoint.fields.emplace_back(crwl::Field{"stations", std::nullopt});
-    endpoint.pagination.mode = crwl::PaginationConfig::Mode::Offset; 
+    endpoint.pagination.mode       = crwl::PaginationConfig::Mode::Offset; 
     endpoint.pagination.param_name = "offset"; 
-    endpoint.pagination.page_size = static_cast<size_t>(std::max(seed.limit, 1));
+    endpoint.pagination.page_size  = static_cast<size_t>(std::max(seed.limit, 1));
     endpoint.pagination.page_delay = cfg_.page_delay; 
 
     std::vector<crwl::Endpoint> endpoints; 
@@ -297,7 +318,6 @@ crwl::Handlers<StationRecord> make_station_handler(ClimateDB& db)
 
   return handlers; 
 }
-
 
 crwl::PageBatch<StationRecord> 
 parse_station_page(const boost::json::object& root, const Fields& fields,
@@ -345,7 +365,6 @@ parse_station_page(const boost::json::object& root, const Fields& fields,
       batch.has_more = (offset + limit) < count; 
     }
   }
-
   return batch; 
 }
 
@@ -353,16 +372,18 @@ StationRecord
 parse_station_record(const boost::json::object& row)
 {
   StationRecord rec{}; 
-  rec.station_id  = boost::json::value_to<std::string>(row.at("id"));
-  rec.name        = jsc::get_or<std::string>(row, "name").value_or("");
-  rec.state       = jsc::get_or<std::string>(row, "state").value_or("");
-  rec.latitude    = jsc::get_or<double>(row, "latitude").value_or(0.0); 
-  rec.longitude   = jsc::get_or<double>(row, "longitude").value_or(0.0); 
-  rec.elevation_m = jsc::get_or<double>(row, "elevation").value_or(0.0); 
+  rec.station_id   = boost::json::value_to<std::string>(row.at("id"));
+  rec.name         = jsc::get_or<std::string>(row, "name").value_or("");
+  rec.state        = jsc::get_or<std::string>(row, "state").value_or("");
+  rec.latitude     = jsc::get_or<double>(row, "latitude").value_or(0.0); 
+  rec.longitude    = jsc::get_or<double>(row, "longitude").value_or(0.0); 
+  rec.elevation_m  = jsc::get_or<double>(row, "elevation").value_or(0.0); 
+  rec.active_start = jsc::get_or<std::string>(row, "mindate").value_or(""); 
+  rec.active_end   = jsc::get_or<std::string>(row, "maxdate").value_or("");
 
   rec.metadata = boost::json::object{}; 
-  constexpr std::array<std::string_view, 8> pass = {
-    "mindate", "maxdate", "datacoverage", "elevationUnit", "network",
+  constexpr std::array<std::string_view, 6> pass = {
+    "datacoverage", "elevationUnit", "network",
     "gsnFlag", "hcnFlag", "wmoID"
   };
 

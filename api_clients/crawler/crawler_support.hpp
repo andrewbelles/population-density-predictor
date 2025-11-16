@@ -22,7 +22,7 @@
 
 #include <boost/json.hpp>  
 
-using millis   = std::chrono::milliseconds;
+using millis = std::chrono::milliseconds;
 
 /************ supporting structures ***********************/
 
@@ -80,6 +80,13 @@ struct CrawlerMetadata {
   {
     endpoints = std::move(new_endpoints);
   }
+};
+
+struct CrawlerConfig {
+  size_t retries{5}; 
+  std::chrono::seconds backoff{1}; 
+
+  // ??? Anything else 
 };
 
 template <class Item> 
